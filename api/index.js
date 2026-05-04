@@ -1,69 +1,35 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
 const https = require('https');
 const http = require('http');
 
-const REFERER = 'https://vidlink.pro/';
-const ORIGIN  = 'https://vidlink.pro';
-const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124';
+// Updated to Videasy's official player domain
+const REFERER = 'https://player.videasy.net/';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// ── WASM singleton (survives warm invocations) ────────────────────────────────
-let wasmReady = false;
-let bootPromise = null;
-
-function bootWasm() {
-  if (bootPromise) return bootPromise;
-  bootPromise = (async () => {
-    globalThis.window = globalThis;
-    globalThis.self = globalThis;
-    globalThis.document = { createElement: () => ({}), body: { appendChild: () => {} } };
-
-    const sodium = require('libsodium-wrappers');
-    await sodium.ready;
-    globalThis.sodium = sodium;
-
-    eval(fs.readFileSync(path.join(__dirname, 'script.js'), 'utf8'));
-
-    const go = new Dm();
-    const wasmBuf = fs.readFileSync(path.join(__dirname, 'fu.wasm'));
-    const { instance } = await WebAssembly.instantiate(wasmBuf, go.importObject);
-    go.run(instance);
-
-    await new Promise(r => setTimeout(r, 500));
-    if (typeof globalThis.getAdv !== 'function') throw new Error('getAdv not found after WASM boot');
-    wasmReady = true;
-  })();
-  return bootPromise;
-}
-
-// ── Stream URL resolver ───────────────────────────────────────────────────────
+/**
+ * Constructs the Videasy Embed URL based on their documentation.
+ */
 async function getStream(id, season, episode) {
-  await bootWasm();
-  const token = globalThis.getAdv(String(id));
-  if (!token) throw new Error('getAdv returned null');
-
-  const apiUrl = season
-    ? `https://vidlink.pro/api/b/tv/${token}/${season}/${episode || 1}?multiLang=0`
-    : `https://vidlink.pro/api/b/movie/${token}?multiLang=0`;
-
-  const res = await fetch(apiUrl, {
-    headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA }
-  });
-  if (!res.ok) throw new Error(`vidlink API returned ${res.status}`);
-  const data = await res.json();
-  const playlist = data?.stream?.playlist;
-  if (!playlist) throw new Error('No playlist in response');
-  return playlist;
+  // Videasy URL Format:
+  // Movie: https://player.videasy.net/movie/{id}
+  // TV:    https://player.videasy.net/tv/{id}/{season}/{episode}
+  
+  if (season) {
+    return `https://player.videasy.net/tv/${id}/${season}/${episode || 1}?nextEpisode=true&episodeSelector=true&overlay=true`;
+  }
+  
+  return `https://player.videasy.net/movie/${id}?overlay=true`;
 }
 
-// ── HLS upstream fetcher with redirect support ────────────────────────────────
+/**
+ * HLS upstream fetcher (kept for the proxy functionality /api?url=...)
+ */
 function fetchUpstream(url, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
     (url.startsWith('https') ? https : http).get(url, {
-      headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' }
+      headers: { 'Referer': REFERER, 'User-Agent': UA, 'Accept': '*/*' }
     }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const loc = res.headers.location;
@@ -74,6 +40,9 @@ function fetchUpstream(url, redirects = 0) {
   });
 }
 
+/**
+ * Replaces segment links in M3U8 files to route back through your proxy
+ */
 function rewriteM3u8(body, url) {
   const base = url.split('?')[0];
   const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
@@ -89,11 +58,12 @@ function rewriteM3u8(body, url) {
 // ── Vercel serverless handler ─────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
 
   const { searchParams } = new URL(req.url, 'http://localhost');
   const q = Object.fromEntries(searchParams);
 
-  // Proxy mode: /api?url=...
+  // 1. Proxy Mode (If you are proxying raw streams)
   if (q.url) {
     const url = decodeURIComponent(q.url);
     try {
@@ -109,7 +79,6 @@ module.exports = async function handler(req, res) {
         return res.end(rewriteM3u8(body, url));
       } else {
         res.setHeader('Content-Type', ct || 'application/octet-stream');
-        if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
         res.statusCode = upstream.statusCode;
         upstream.pipe(res);
       }
@@ -120,7 +89,7 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  // Stream lookup: /api?id=550  or  /api?id=456&s=1&e=2
+  // 2. Stream Lookup: /api?id=TMDB_ID
   if (!q.id) {
     res.statusCode = 400;
     res.setHeader('Content-Type', 'application/json');
@@ -130,6 +99,7 @@ module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   try {
     const url = await getStream(q.id, q.s, q.e);
+    // Returns the Videasy Embed URL
     res.end(JSON.stringify({ url }));
   } catch (err) {
     res.statusCode = 500;
